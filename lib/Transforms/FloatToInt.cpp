@@ -88,14 +88,35 @@ public:
     });
 
     // Replace Constant Operations
-    for (Operation *op : constantOpsToReplace) 
+    for (Operation *op : constantOpsToReplace)
     {
       rewriter.setInsertionPoint(op);
-      
-      Type newType = convertType(op->getResult(0).getType());
 
-      auto zeroAttr = llvm::cast<TypedAttr>(rewriter.getZeroAttr(newType));
-      auto newConstant = rewriter.create<arith::ConstantOp>(op->getLoc(), zeroAttr);
+      Type newType = convertType(op->getResult(0).getType());
+      Attribute valueAttr = op->getAttr("value");
+      TypedAttr newAttr;
+
+      if (auto floatAttr = llvm::dyn_cast<FloatAttr>(valueAttr))
+      {
+        // Scalar: reinterpret the float bits as an integer
+        APInt bits = floatAttr.getValue().bitcastToAPInt();
+        newAttr = IntegerAttr::get(newType, bits);
+      }
+      else if (auto denseAttr = llvm::dyn_cast<DenseFPElementsAttr>(valueAttr))
+      {
+        // Tensor: reinterpret the bits of each float element
+        auto intType = llvm::cast<ShapedType>(newType).getElementType();
+
+        SmallVector<APInt> values;
+        for (const APFloat &floatValue : denseAttr.getValues<APFloat>())
+        {
+          values.push_back(floatValue.bitcastToAPInt());
+        }
+
+        newAttr = DenseIntElementsAttr::get(llvm::cast<ShapedType>(newType), values);
+      }
+
+      auto newConstant = rewriter.create<arith::ConstantOp>(op->getLoc(), newAttr);
 
       op->replaceAllUsesWith(newConstant);
       rewriter.eraseOp(op);
