@@ -1,0 +1,13 @@
+# Dependências Python do mlir-test: importação ONNX -> StableHLO.
+# Uso:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+
+-f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.14.1+cpu
+torch-mlir==20260411.779
+numpy==2.2.6
+onnx==1.20.1
+onnxruntime==1.23.2
