@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
-# Create a ZIP archive of the project, excluding Git metadata,
-# virtual environments, build artifacts, Python cache files,
-# and the StableHLO submodule.
+# Create a ZIP archive of the project, excluding unnecessary stuff
 #
 # Usage:
 #   bash scripts/zip.sh
@@ -26,8 +24,11 @@ zip -r "$OUTPUT" . \
      "*/.venv/*" ".venv/*" \
      "*/bin/*" "bin/*" \
      "*/build/*" "build/*" \
+     "*/.vscode/*" ".vscode/*" \
+     "*/.cache/*" ".cache/*" \
+     ".clangd" \
      "external/stablehlo/*" \
      "*/__pycache__/*" \
      "*.pyc"
 
-echo "Projeto compactado em: $OUTPUT"
+echo "Project zipped to: $OUTPUT"

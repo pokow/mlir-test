@@ -3,6 +3,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/ADT/SmallVector.h"
+#include "stablehlo/dialect/StablehloOps.h"
 
 #include <vector>
 
