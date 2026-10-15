@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Locate and validate the LLVM/MLIR installation.
+#
+# Usage:
+#   source scripts/env_check.sh
+
 # Locate LLVM if LLVM_BUILD_DIR was not provided.
 if [ -z "$LLVM_BUILD_DIR" ]; then
     for dir in \

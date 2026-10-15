@@ -1,5 +1,5 @@
-# Dependências Python do mlir-test: importação ONNX -> StableHLO.
-# Uso:
+# Python dependencies for mlir-test: ONNX -> StableHLO import.
+# Usage:
 #   python3 -m venv .venv && source .venv/bin/activate
 #   pip install -r requirements.txt
 

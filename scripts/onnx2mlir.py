@@ -1,29 +1,32 @@
-"""Convert ONNX model into an MLIR file, using mainly upstream dialects.
+"""
+Convert an ONNX model into MLIR using torch-mlir and StableHLO.
 
-This script uses torch-mlir to convert ONNX models into MLIR files. We avoid
-using non-upstream dialects (e.g., `torch`), since the main goal is to use
-these models in projects that.
+This script imports an ONNX model into MLIR and runs the torch-mlir
+conversion pipelines to lower it to StableHLO-based IR. It also performs
+ONNX opset upgrading when needed and shape inference before importing
+the model.
 
-This script can be called directly via command line, but you can also use it
-as a module to import the `convert_onnx_to_mlir` function.
+The script can be used from the command line or imported as a Python
+module to use the `convert_onnx_to_mlir` function.
 
 Usage:
-    onnx2mlir.py [-h] [-o FILENAME]
-                      [--emit-bytecode]
-                      [--elide-constants-if-larger N]
-                      model_path
+    python3 scripts/onnx2mlir.py <model_path> [-o <output_file>]
+        [--emit-bytecode]
+        [--elide-constants-if-larger N]
 
 Arguments:
     model_path
-        input ONNX model path
-    -o FILENAME
-        output filename
+        Path to the input ONNX model.
+    -o <output_file>
+        Path to the output MLIR file. If omitted, the converted module
+        is returned but not saved to a file.
     --emit-bytecode
-        emit bytecode when generating output (default: False)
+        Write the output in MLIR bytecode format instead of text.
     --elide-constants-if-larger N
-        elide constants in emitted IR if larger than specified value
+        Omit the contents of constants larger than N elements in the
+        textual MLIR output.
     -h, --help
-        show help message and exit
+        Display usage information.
 """
 
 import argparse

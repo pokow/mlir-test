@@ -1,5 +1,15 @@
 #!/bin/bash
 
+# Convert all ONNX models in a directory into StableHLO-based MLIR files.
+#
+# Usage:
+#   bash scripts/import_onnx_files.sh -d <models-dir> -o <output-dir> [OPTIONS]
+#
+# Options:
+#   -b, --emit-bytecode                Emit MLIR bytecode instead of text.
+#   -e, --elide-constants-if-larger N  Elide constants larger than N elements.
+#   -h, --help                         Display usage information.
+
 ######################### Config #########################
 
 set -e

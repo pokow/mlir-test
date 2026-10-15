@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Build the MLIR project using the configured LLVM/MLIR installation.
+#
+# Usage:
+#   bash scripts/build.sh
+
 set -e
 
 # Load and validate the environment.
