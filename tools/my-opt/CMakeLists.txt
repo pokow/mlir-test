@@ -8,7 +8,11 @@ target_link_libraries(
   my-opt
   PRIVATE
   MLIROptLib
+  MLIRRegisterAllDialects
+  MLIRRegisterAllPasses
   MyTransforms
+  StablehloRegister
+  StablehloOps
   ${dialect_libs}
   ${conversion_libs}
 )

@@ -7,6 +7,8 @@ set -e
 ROOT_DIR="$(dirname $(dirname "${BASH_SOURCE[0]}"))"
 TMP_DIR="$ROOT_DIR/tmp"
 
+trap 'rm -rf "$TMP_DIR"' EXIT
+
 ######################### Arg parsing #########################
 
 # Default values
