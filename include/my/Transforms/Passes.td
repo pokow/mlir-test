@@ -7,7 +7,7 @@ def FloatToInt : Pass<"float-to-int", "mlir::func::FuncOp">
 {
   let summary = "Converts float types to integer types";
   let description = [{ Converts float tensors (and related arith ops) to integer tensors. }];
-  let dependentDialects = ["mlir::stablehlo::stablehloDialect"];
+  let dependentDialects = ["mlir::stablehlo::StablehloDialect"];
 }
 
 def ICount : Pass<"icount", "mlir::ModuleOp">

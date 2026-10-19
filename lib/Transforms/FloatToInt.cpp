@@ -2,7 +2,8 @@
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "llvm/ADT/SmallVector.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
 #include <vector>
@@ -18,21 +19,54 @@ namespace my
 namespace
 {
 
-// Converts FloatType or RankedTensorType of floats to integer type
-Type convertType(Type t)
+// TypeConverter: fN -> iN, tensor<...xfN> -> tensor<...xiN>
+class FloatToIntTypeConverter : public TypeConverter
 {
-  if (auto f = llvm::dyn_cast<FloatType>(t))
+public:
+  FloatToIntTypeConverter()
   {
-    return IntegerType::get(t.getContext(), f.getWidth());
-  }
+    // Keeps types that do not need to be converted.
+    addConversion([](Type t) -> Type
+    {
+      return t;
+    });
 
-  if (auto rt = llvm::dyn_cast<RankedTensorType>(t))
-  {
-    Type newElemType = convertType(rt.getElementType());
-    return RankedTensorType::get(rt.getShape(), newElemType, rt.getEncoding());
-  }
+    // Converts any float type to an integer type of the same width.
+    addConversion([](FloatType f)-> Type
+    {
+      return IntegerType::get(f.getContext(), f.getWidth());
+    });
 
-  return t;
+    // Converts the element type of ranked tensors.
+    addConversion([this](RankedTensorType rt) -> Type
+    {
+      Type elem = convertType(rt.getElementType());
+      if (!elem)
+      {
+        return nullptr;
+      }
+      return RankedTensorType::get(rt.getShape(), elem, rt.getEncoding());
+    });
+
+    // Materializes values
+    auto bitcast = [](OpBuilder &builder, Type resultType, ValueRange inputs, Location loc) -> Value
+    {
+      if (inputs.size() != 1)
+      {
+        return nullptr;
+      }
+      return builder.create<stablehlo::BitcastConvertOp>(loc, resultType, inputs[0]);
+    };
+
+    addSourceMaterialization(bitcast); // int -> float
+    addTargetMaterialization(bitcast); // float -> int
+  }
+};
+
+// Check if an operation is constant
+bool isConstantLikeOp(Operation *op) 
+{
+  return op->hasTrait<OpTrait::ConstantLike>();
 }
 
 class FloatToIntPass : public impl::FloatToIntBase<FloatToIntPass>
@@ -42,42 +76,46 @@ public:
   void runOnOperation() override
   {
     // Get current func::FuncOp
-    auto F = getOperation();
+    auto funcOp = getOperation();
 
-    IRRewriter rewriter(F.getContext());
+    // Get FuncOp context
+    auto *ctx = funcOp->getContext();
+
+    FloatToIntTypeConverter typeConverter;
+    IRRewriter rewriter(ctx);
 
     // Update function signature
-    for (BlockArgument arg : F.getArguments())
+    for (BlockArgument arg : funcOp.getArguments())
     {
-      arg.setType(convertType(arg.getType()));
+      arg.setType(typeConverter.convertType(arg.getType()));
     }
 
     // Update function input and output type list
     SmallVector<Type> newInputs;
     SmallVector<Type> newResults;
 
-    for (Type t : F.getArgumentTypes())
+    for (Type t : funcOp.getArgumentTypes())
     {
-      newInputs.push_back(convertType(t));
+      newInputs.push_back(typeConverter.convertType(t));
     }
 
-    for (Type t : F.getResultTypes())
+    for (Type t : funcOp.getResultTypes())
     {
-      newResults.push_back(convertType(t));
+      newResults.push_back(typeConverter.convertType(t));
     }
 
     // Override original type of the function
-    F.setFunctionType(rewriter.getFunctionType(newInputs, newResults));
+    funcOp.setFunctionType(rewriter.getFunctionType(newInputs, newResults));
 
     // Collect the operations (AST walk)
-    std::vector<Operation *> constantOpsToReplace;
-    std::vector<Operation *> arithOpsToReplace;
+    SmallVector<Operation *> constantOpsToReplace;
+    SmallVector<Operation *> arithOpsToReplace;
 
-    F.walk([&](Operation *op)
+    funcOp.walk([&](Operation *op)
     {
       if (auto cst = llvm::dyn_cast<arith::ConstantOp>(op))
       {
-        if (convertType(cst.getType()) != cst.getType())
+        if (typeConverter.convertType(cst.getType()) != cst.getType())
         {
           constantOpsToReplace.push_back(op);
         }
@@ -93,7 +131,7 @@ public:
     {
       rewriter.setInsertionPoint(op);
 
-      Type newType = convertType(op->getResult(0).getType());
+      Type newType = typeConverter.convertType(op->getResult(0).getType());
       Attribute valueAttr = op->getAttr("value");
       TypedAttr newAttr;
 
