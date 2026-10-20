@@ -3,7 +3,7 @@
 
 include "mlir/Pass/PassBase.td"
 
-def FloatToInt : Pass<"float-to-int", "mlir::func::FuncOp">
+def FloatToInt : Pass<"float-to-int", "mlir::ModuleOp">
 {
   let summary = "Converts float types to integer types";
   let description = [{ Converts float tensors (and related arith ops) to integer tensors. }];
