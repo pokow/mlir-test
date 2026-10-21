@@ -1,49 +1,54 @@
 #include "my/Transforms/Passes.h"
 
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
-#include <vector>
-
 using namespace mlir;
 
-namespace my
-{
+namespace my {
 
 #define GEN_PASS_DEF_FLOATTOINT
 #include "my/Transforms/Passes.h.inc"
 
-namespace
-{
+namespace {
+
+// Auxiliar para identificar ops matematicas restritas a tipos float no StableHLO
+static bool isFloatOnlyMathOp(Operation *op) {
+  StringRef name = op->getName().getStringRef();
+  return name == "stablehlo.exponential" ||
+         name == "stablehlo.exponential_minus_one" ||
+         name == "stablehlo.log" ||
+         name == "stablehlo.log_plus_one" ||
+         name == "stablehlo.logistic" ||
+         name == "stablehlo.tanh" ||
+         name == "stablehlo.sine" ||
+         name == "stablehlo.cosine" ||
+         name == "stablehlo.sqrt" ||
+         name == "stablehlo.rsqrt" ||
+         name == "stablehlo.atan2" ||
+         name == "stablehlo.power" ||
+         name == "stablehlo.is_finite";
+}
 
 // TypeConverter: fN -> iN, tensor<...xfN> -> tensor<...xiN>
-class FloatToIntTypeConverter : public TypeConverter
-{
+class FloatToIntTypeConverter : public TypeConverter {
 public:
-  FloatToIntTypeConverter()
-  {
-    // Keeps types that do not need to be converted.
-    addConversion([](Type t) -> Type
-    {
-      return t;
-    });
+  FloatToIntTypeConverter() {
+    addConversion([](Type t) -> Type { return t; });
 
-    // Converts any float type to an integer type of the same width.
-    addConversion([](FloatType f)-> Type
-    {
+    addConversion([](FloatType f) -> Type {
       return IntegerType::get(f.getContext(), f.getWidth());
     });
 
-    // Converts the element type of ranked tensors.
-    addConversion([this](RankedTensorType rt) -> Type
-    {
+    addConversion([this](RankedTensorType rt) -> Type {
       Type elem = convertType(rt.getElementType());
-      if (!elem)
-      {
+      if (!elem) {
         return nullptr;
       }
       return RankedTensorType::get(rt.getShape(), elem, rt.getEncoding());
@@ -51,111 +56,157 @@ public:
   }
 };
 
-// Converts signature and entry block argument types (fN -> iN).
-// Leaves the IR invalid until convertBody fixes the uses.
-void convertFunction(func::FuncOp &funcOp,
-                      FloatToIntTypeConverter &typeConverter,
-                      IRRewriter &rewriter)
-{
-  FunctionType oldFuncType = funcOp.getFunctionType();
+class ConvertConstantOp : public OpConversionPattern<stablehlo::ConstantOp> {
+  using OpConversionPattern<stablehlo::ConstantOp>::OpConversionPattern;
 
-  // Compute new type lists first
-  SmallVector<Type> newInputs;
-  SmallVector<Type> newResults;
+  LogicalResult matchAndRewrite(stablehlo::ConstantOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    Attribute valueAttr = op.getValue();
+    Type newResultType = getTypeConverter()->convertType(op.getType());
+    if (!newResultType)
+      return failure();
 
-  for (Type t : oldFuncType.getInputs())
-  {
-    Type newT = typeConverter.convertType(t);
-    newInputs.push_back(newT);
+    ElementsAttr newValueAttr;
+
+    if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
+      Type newElemType = llvm::cast<ShapedType>(newResultType).getElementType();
+      newValueAttr = denseAttr.bitcast(newElemType);
+    } else if (auto resourceAttr = llvm::dyn_cast<DenseResourceElementsAttr>(valueAttr)) {
+      newValueAttr = DenseResourceElementsAttr::get(
+          llvm::cast<ShapedType>(newResultType), resourceAttr.getRawHandle());
+    } else {
+      return failure();
+    }
+
+    rewriter.replaceOpWithNewOp<stablehlo::ConstantOp>(op, newResultType, newValueAttr);
+    return success();
   }
+};
 
-  for (Type t : oldFuncType.getResults())
-  {
-    Type newT = typeConverter.convertType(t);
-    newResults.push_back(newT);
-  }
+class ConvertFuncSignature : public OpConversionPattern<func::FuncOp> {
+  using OpConversionPattern<func::FuncOp>::OpConversionPattern;
 
-  for (BlockArgument arg : funcOp.getArguments())
-  {
-    arg.setType(typeConverter.convertType(arg.getType()));
-  }
+  LogicalResult matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    auto &converter = *getTypeConverter();
+    TypeConverter::SignatureConversion signatureConverter(funcOp.getNumArguments());
 
-  funcOp.setFunctionType(rewriter.getFunctionType(newInputs, newResults));
-}
+    if (failed(converter.convertSignatureArgs(funcOp.getFunctionType().getInputs(), signatureConverter)))
+      return failure();
 
-void convertCall(func::CallOp &callOp,
-                 FloatToIntTypeConverter &typeConverter,
-                 IRRewriter &rewriter)
-{
-  // Change the type of the arguments
-  for (Value argument : callOp->getOperands())
-  {
-    argument.setType(typeConverter.convertType(argument.getType()));
-  }
-  // Change the type of the results
-  for (Value result : callOp.getResults())
-  {
-    result.setType(typeConverter.convertType(result.getType()));
-  }
-}
+    SmallVector<Type, 4> newResultTypes;
+    if (failed(converter.convertTypes(funcOp.getFunctionType().getResults(), newResultTypes)))
+      return failure();
 
-class FloatToIntPass : public impl::FloatToIntBase<FloatToIntPass>
-{
-public:
+    auto newFuncType = rewriter.getFunctionType(signatureConverter.getConvertedTypes(), newResultTypes);
 
-  void runOnOperation() override
-  {
-    // Get current ModuleOp
-    auto moduleOp = getOperation();
-
-    // Get current ModuleOp context
-    auto *ctx = moduleOp->getContext();
-
-    // Instance FloatToIntTypeConverter
-    FloatToIntTypeConverter typeConverter;
-
-    // Instance IRRewriter
-    IRRewriter rewriter(ctx);
-
-    // Collect all FuncOps and CallOps (before mutating the IR)
-    SmallVector<func::FuncOp> funcOps;
-    SmallVector<func::CallOp> callOps;
-
-    moduleOp.walk([&](Operation *op)
-    {
-      if (auto funcOp = dyn_cast<func::FuncOp>(op))
-      {
-        funcOps.push_back(funcOp);
-      }
-      else if (auto callOp = dyn_cast<func::CallOp>(op))
-      {
-        callOps.push_back(callOp);
+    rewriter.modifyOpInPlace(funcOp, [&]() {
+      funcOp.setType(newFuncType);
+      if (!funcOp.getBody().empty()) {
+        rewriter.applySignatureConversion(&funcOp.getBody().front(), signatureConverter, &converter);
       }
     });
 
-    // Convert FuncOps first (signature, entry block, returns)
-    for (func::FuncOp funcOp : funcOps)
-    {
-      convertFunction(funcOp, typeConverter, rewriter);
+    return success();
+  }
+};
+
+// Converte ops matematicas float-only para custom_call preservando o nome original
+class ConvertFloatMathOp : public ConversionPattern {
+public:
+  ConvertFloatMathOp(TypeConverter &typeConverter, MLIRContext *context)
+      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), 1, context) {}
+
+  LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                ConversionPatternRewriter &rewriter) const override {
+    if (!isFloatOnlyMathOp(op))
+      return failure();
+
+    SmallVector<Type, 4> newResultTypes;
+    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), newResultTypes)))
+      return failure();
+
+    rewriter.replaceOpWithNewOp<stablehlo::CustomCallOp>(
+        op,
+        newResultTypes,
+        operands,
+        rewriter.getStringAttr(op->getName().stripDialect()),
+        /*has_side_effect=*/BoolAttr(),
+        /*backend_config=*/Attribute(),
+        /*api_version=*/stablehlo::CustomCallApiVersionAttr(),
+        /*called_computations=*/ArrayAttr(),
+        /*operand_layouts=*/ArrayAttr(),
+        /*result_layouts=*/ArrayAttr(),
+        /*output_operand_aliases=*/ArrayAttr());
+
+    return success();
+  }
+};
+
+class GenericOpTypeConversion : public ConversionPattern {
+public:
+  GenericOpTypeConversion(TypeConverter &typeConverter, MLIRContext *context)
+      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), 1, context) {}
+
+  LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                                ConversionPatternRewriter &rewriter) const override {
+    if (isa<func::FuncOp, stablehlo::ConstantOp>(op) || isFloatOnlyMathOp(op))
+      return failure();
+
+    SmallVector<Type, 4> newResultTypes;
+    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), newResultTypes)))
+      return failure();
+
+    OperationState state(op->getLoc(), op->getName(), operands,
+                         newResultTypes, op->getAttrs(), op->getSuccessors());
+    for (unsigned i = 0; i < op->getNumRegions(); ++i)
+      state.addRegion();
+
+    Operation *newOp = rewriter.create(state);
+    for (auto [srcRegion, dstRegion] : llvm::zip(op->getRegions(), newOp->getRegions())) {
+      rewriter.inlineRegionBefore(srcRegion, dstRegion, dstRegion.end());
+      if (failed(rewriter.convertRegionTypes(&dstRegion, *getTypeConverter())))
+        return failure();
     }
 
-    // Then convert CallOps (callees already have the new signature)
-    for (func::CallOp callOp : callOps)
-    {
-      convertCall(callOp, typeConverter, rewriter);
+    rewriter.replaceOp(op, newOp->getResults());
+    return success();
+  }
+};
+
+class FloatToIntPass : public impl::FloatToIntBase<FloatToIntPass> {
+public:
+  using impl::FloatToIntBase<FloatToIntPass>::FloatToIntBase;
+
+  void runOnOperation() override {
+    ModuleOp moduleOp = getOperation();
+    MLIRContext *ctx = &getContext();
+
+    FloatToIntTypeConverter typeConverter;
+    RewritePatternSet patterns(ctx);
+
+    patterns.add<ConvertConstantOp, ConvertFuncSignature>(typeConverter, ctx);
+    patterns.add<ConvertFloatMathOp>(typeConverter, ctx);
+    patterns.add<GenericOpTypeConversion>(typeConverter, ctx);
+
+    ConversionTarget target(*ctx);
+
+    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+      return typeConverter.isSignatureLegal(op.getFunctionType()) &&
+             typeConverter.isLegal(&op.getFunctionBody());
+    });
+
+    target.addDynamicallyLegalOp<stablehlo::ConstantOp>([&](stablehlo::ConstantOp op) {
+      return typeConverter.isLegal(op.getType());
+    });
+
+    target.markUnknownOpDynamicallyLegal([&](Operation *op) {
+      return typeConverter.isLegal(op);
+    });
+
+    if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
+      signalPassFailure();
     }
-
-    // Check that the IR is still valid
-    // if (failed(verify(moduleOp)))
-    // {
-    //   signalPassFailure();
-    // }
-
-    // Etapa 2 (depois): corpo
-    // for (func::FuncOp funcOp : funcOps)
-    // {
-    //   convertBody(funcOp, typeConverter, rewriter);
-    // }
   }
 };
 
