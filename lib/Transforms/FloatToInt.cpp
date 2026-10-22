@@ -5,7 +5,6 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/Verifier.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
@@ -18,22 +17,30 @@ namespace my {
 
 namespace {
 
-// Auxiliar para identificar ops matematicas restritas a tipos float no StableHLO
+// Identifica operações estritamente restritas a ponto flutuante no TableGen do StableHLO
 static bool isFloatOnlyMathOp(Operation *op) {
-  StringRef name = op->getName().getStringRef();
-  return name == "stablehlo.exponential" ||
-         name == "stablehlo.exponential_minus_one" ||
-         name == "stablehlo.log" ||
-         name == "stablehlo.log_plus_one" ||
-         name == "stablehlo.logistic" ||
-         name == "stablehlo.tanh" ||
-         name == "stablehlo.sine" ||
-         name == "stablehlo.cosine" ||
-         name == "stablehlo.sqrt" ||
-         name == "stablehlo.rsqrt" ||
-         name == "stablehlo.atan2" ||
-         name == "stablehlo.power" ||
-         name == "stablehlo.is_finite";
+  return llvm::isa<stablehlo::ExpOp,
+                   stablehlo::Expm1Op,
+                   stablehlo::LogOp,
+                   stablehlo::Log1pOp,
+                   stablehlo::LogisticOp,
+                   stablehlo::TanhOp,
+                   stablehlo::SineOp,
+                   stablehlo::CosineOp,
+                   stablehlo::TanOp,
+                   stablehlo::Atan2Op,
+                   stablehlo::SqrtOp,
+                   stablehlo::RsqrtOp,
+                   stablehlo::CbrtOp,
+                   stablehlo::CeilOp,
+                   stablehlo::FloorOp,
+                   stablehlo::RoundOp,
+                   stablehlo::RoundNearestEvenOp,
+                   stablehlo::IsFiniteOp,
+                   stablehlo::ComplexOp,
+                   stablehlo::RealOp,
+                   stablehlo::ImagOp,
+                   stablehlo::ReducePrecisionOp>(op);
 }
 
 // TypeConverter: fN -> iN, tensor<...xfN> -> tensor<...xiN>
@@ -48,14 +55,14 @@ public:
 
     addConversion([this](RankedTensorType rt) -> Type {
       Type elem = convertType(rt.getElementType());
-      if (!elem) {
+      if (!elem)
         return nullptr;
-      }
       return RankedTensorType::get(rt.getShape(), elem, rt.getEncoding());
     });
   }
 };
 
+// Conversão de Constantes (Suporta DenseElementsAttr e DenseResourceElementsAttr)
 class ConvertConstantOp : public OpConversionPattern<stablehlo::ConstantOp> {
   using OpConversionPattern<stablehlo::ConstantOp>::OpConversionPattern;
 
@@ -83,6 +90,7 @@ class ConvertConstantOp : public OpConversionPattern<stablehlo::ConstantOp> {
   }
 };
 
+// Conversão de Assinatura de Funções
 class ConvertFuncSignature : public OpConversionPattern<func::FuncOp> {
   using OpConversionPattern<func::FuncOp>::OpConversionPattern;
 
@@ -111,11 +119,11 @@ class ConvertFuncSignature : public OpConversionPattern<func::FuncOp> {
   }
 };
 
-// Converte ops matematicas float-only para custom_call preservando o nome original
+// Padrão 1 (Prioridade 2): Isola operações float-only em custom_call
 class ConvertFloatMathOp : public ConversionPattern {
 public:
   ConvertFloatMathOp(TypeConverter &typeConverter, MLIRContext *context)
-      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), 1, context) {}
+      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/2, context) {}
 
   LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                                 ConversionPatternRewriter &rewriter) const override {
@@ -143,10 +151,11 @@ public:
   }
 };
 
+// Padrão 2 (Prioridade 1): Atualiza o tipo de operações polimórficas/estruturais mantendo a instrução nativa
 class GenericOpTypeConversion : public ConversionPattern {
 public:
   GenericOpTypeConversion(TypeConverter &typeConverter, MLIRContext *context)
-      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), 1, context) {}
+      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/1, context) {}
 
   LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                                 ConversionPatternRewriter &rewriter) const override {
