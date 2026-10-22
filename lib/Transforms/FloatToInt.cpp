@@ -2,11 +2,14 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APSInt.h"
 
 using namespace mlir;
 
@@ -43,14 +46,15 @@ static bool isFloatOnlyMathOp(Operation *op) {
                    stablehlo::ReducePrecisionOp>(op);
 }
 
-// TypeConverter: fN -> iN, tensor<...xfN> -> tensor<...xiN>
+// TypeConverter com suporte a i8 e Materializações Automáticas de Pontes (i8 <-> f32)
 class FloatToIntTypeConverter : public TypeConverter {
 public:
   FloatToIntTypeConverter() {
     addConversion([](Type t) -> Type { return t; });
 
+    // Converte qualquer FloatType (f32, f16, etc.) para i8
     addConversion([](FloatType f) -> Type {
-      return IntegerType::get(f.getContext(), f.getWidth());
+      return IntegerType::get(f.getContext(), 8);
     });
 
     addConversion([this](RankedTensorType rt) -> Type {
@@ -59,10 +63,24 @@ public:
         return nullptr;
       return RankedTensorType::get(rt.getShape(), elem, rt.getEncoding());
     });
+
+    // Materialização de Origem: Injeta stablehlo.convert quando uma op legal (ex: exp) precisa de f32 a partir de i8
+    addSourceMaterialization([](OpBuilder &builder, Type resultType, ValueRange inputs, Location loc) -> Value {
+      if (inputs.size() != 1)
+        return nullptr;
+      return stablehlo::ConvertOp::create(builder, loc, resultType, inputs[0]);
+    });
+
+    // Materialização de Destino: Injeta stablehlo.convert quando o resultado f32 deve alimentar uma op convertida para i8
+    addTargetMaterialization([](OpBuilder &builder, Type resultType, ValueRange inputs, Location loc) -> Value {
+      if (inputs.size() != 1)
+        return nullptr;
+      return stablehlo::ConvertOp::create(builder, loc, resultType, inputs[0]);
+    });
   }
 };
 
-// Conversão de Constantes (Suporta DenseElementsAttr e DenseResourceElementsAttr)
+// Conversão de Constantes por Truncamento (Float -> i8)
 class ConvertConstantOp : public OpConversionPattern<stablehlo::ConstantOp> {
   using OpConversionPattern<stablehlo::ConstantOp>::OpConversionPattern;
 
@@ -77,7 +95,19 @@ class ConvertConstantOp : public OpConversionPattern<stablehlo::ConstantOp> {
 
     if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
       Type newElemType = llvm::cast<ShapedType>(newResultType).getElementType();
-      newValueAttr = denseAttr.bitcast(newElemType);
+      unsigned bitWidth = newElemType.getIntOrFloatBitWidth();
+
+      SmallVector<APInt> intValues;
+      intValues.reserve(denseAttr.getNumElements());
+
+      for (APFloat floatVal : denseAttr.getValues<APFloat>()) {
+        APSInt intVal(bitWidth, /*isUnsigned=*/false);
+        bool isExact;
+        floatVal.convertToInteger(intVal, APFloat::rmTowardZero, &isExact);
+        intValues.push_back(intVal);
+      }
+
+      newValueAttr = DenseElementsAttr::get(llvm::cast<ShapedType>(newResultType), intValues);
     } else if (auto resourceAttr = llvm::dyn_cast<DenseResourceElementsAttr>(valueAttr)) {
       newValueAttr = DenseResourceElementsAttr::get(
           llvm::cast<ShapedType>(newResultType), resourceAttr.getRawHandle());
@@ -90,68 +120,7 @@ class ConvertConstantOp : public OpConversionPattern<stablehlo::ConstantOp> {
   }
 };
 
-// Conversão de Assinatura de Funções
-class ConvertFuncSignature : public OpConversionPattern<func::FuncOp> {
-  using OpConversionPattern<func::FuncOp>::OpConversionPattern;
-
-  LogicalResult matchAndRewrite(func::FuncOp funcOp, OpAdaptor adaptor,
-                                ConversionPatternRewriter &rewriter) const override {
-    auto &converter = *getTypeConverter();
-    TypeConverter::SignatureConversion signatureConverter(funcOp.getNumArguments());
-
-    if (failed(converter.convertSignatureArgs(funcOp.getFunctionType().getInputs(), signatureConverter)))
-      return failure();
-
-    SmallVector<Type, 4> newResultTypes;
-    if (failed(converter.convertTypes(funcOp.getFunctionType().getResults(), newResultTypes)))
-      return failure();
-
-    auto newFuncType = rewriter.getFunctionType(signatureConverter.getConvertedTypes(), newResultTypes);
-
-    rewriter.modifyOpInPlace(funcOp, [&]() {
-      funcOp.setType(newFuncType);
-      if (!funcOp.getBody().empty()) {
-        rewriter.applySignatureConversion(&funcOp.getBody().front(), signatureConverter, &converter);
-      }
-    });
-
-    return success();
-  }
-};
-
-// Padrão 1 (Prioridade 2): Isola operações float-only em custom_call
-class ConvertFloatMathOp : public ConversionPattern {
-public:
-  ConvertFloatMathOp(TypeConverter &typeConverter, MLIRContext *context)
-      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), /*benefit=*/2, context) {}
-
-  LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
-                                ConversionPatternRewriter &rewriter) const override {
-    if (!isFloatOnlyMathOp(op))
-      return failure();
-
-    SmallVector<Type, 4> newResultTypes;
-    if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), newResultTypes)))
-      return failure();
-
-    rewriter.replaceOpWithNewOp<stablehlo::CustomCallOp>(
-        op,
-        newResultTypes,
-        operands,
-        rewriter.getStringAttr(op->getName().stripDialect()),
-        /*has_side_effect=*/BoolAttr(),
-        /*backend_config=*/Attribute(),
-        /*api_version=*/stablehlo::CustomCallApiVersionAttr(),
-        /*called_computations=*/ArrayAttr(),
-        /*operand_layouts=*/ArrayAttr(),
-        /*result_layouts=*/ArrayAttr(),
-        /*output_operand_aliases=*/ArrayAttr());
-
-    return success();
-  }
-};
-
-// Padrão 2 (Prioridade 1): Atualiza o tipo de operações polimórficas/estruturais mantendo a instrução nativa
+// Conversão genérica de tipos para operações estruturais e aritméticas (add, conv, dot, etc.)
 class GenericOpTypeConversion : public ConversionPattern {
 public:
   GenericOpTypeConversion(TypeConverter &typeConverter, MLIRContext *context)
@@ -194,22 +163,47 @@ public:
     FloatToIntTypeConverter typeConverter;
     RewritePatternSet patterns(ctx);
 
-    patterns.add<ConvertConstantOp, ConvertFuncSignature>(typeConverter, ctx);
-    patterns.add<ConvertFloatMathOp>(typeConverter, ctx);
+    // Padrões de reescrita de constantes e operações genéricas
+    patterns.add<ConvertConstantOp>(typeConverter, ctx);
     patterns.add<GenericOpTypeConversion>(typeConverter, ctx);
+
+    // Helpers padrão do MLIR para conversão do dialeto func (assinaturas, chamadas e retornos)
+    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(patterns, typeConverter);
+    populateCallOpTypeConversionPattern(patterns, typeConverter);
+    populateReturnOpTypeConversionPattern(patterns, typeConverter);
 
     ConversionTarget target(*ctx);
 
+    // Regras de legalidade para funções e retornos
     target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
       return typeConverter.isSignatureLegal(op.getFunctionType()) &&
              typeConverter.isLegal(&op.getFunctionBody());
+    });
+
+    target.addDynamicallyLegalOp<func::ReturnOp>([&](func::ReturnOp op) {
+      return typeConverter.isLegal(op->getOperandTypes());
     });
 
     target.addDynamicallyLegalOp<stablehlo::ConstantOp>([&](stablehlo::ConstantOp op) {
       return typeConverter.isLegal(op.getType());
     });
 
+    // Regras dinâmicas para o restante do IR
     target.markUnknownOpDynamicallyLegal([&](Operation *op) {
+      // 1. Operações exclusivamente float são LEGAIS se mantiverem os seus operandos e resultados em float
+      if (isFloatOnlyMathOp(op)) {
+        return llvm::any_of(op->getResultTypes(), [](Type t) {
+          if (auto st = llvm::dyn_cast<ShapedType>(t))
+            return llvm::isa<FloatType>(st.getElementType());
+          return llvm::isa<FloatType>(t);
+        });
+      }
+
+      // 2. A instrução stablehlo.convert é LEGAL para realizar a ponte de tipos (i8 <-> f32)
+      if (isa<stablehlo::ConvertOp>(op))
+        return true;
+
+      // 3. As restantes operações devem estar convertidas para i8
       return typeConverter.isLegal(op);
     });
 
